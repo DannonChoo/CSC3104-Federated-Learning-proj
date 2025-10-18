@@ -1,0 +1,195 @@
+# docker/compose.yml  (no "version:" key)
+
+# Common app env (mounted into our Python containers)
+x-app-env: &app_env
+  CSV_PATH: /app/app_data/DATA.csv
+  DATA_DIR: /app/app_data
+  MODELS_DIR: /app/models
+  KAFKA_BOOTSTRAP: kafka:9092
+  TOPIC_INFER_REQUESTS: ai.infer.requests
+  TOPIC_RISK_CLASSIFICATIONS: ai.risk.classifications
+
+# Provide a default SITE_ID so compose doesn’t warn when parsing
+x-site-env: &site_env
+  <<: *app_env
+  SITE_ID: "0"
+
+services:
+  # Single-broker Kafka in KRaft mode (Confluent 7.6.1)
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    environment:
+      # KRaft identity (must be a valid ID from kafka-storage random-uuid)
+      CLUSTER_ID: "N5fzApPQRmm8qgGrwmw-dA"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+
+      # KRaft single-node
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_NODE_ID: "1"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
+      # Listeners (internal for containers, host for Windows tools)
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+      # Single-node replication factors
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "cub kafka-ready -b kafka:9092 1 20 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-off container to create topics after Kafka is healthy
+  create-topics:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["bash","-lc","kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ai.infer.requests --partitions 3 --replication-factor 1 && kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ai.risk.classifications --partitions 3 --replication-factor 1 && kafka-topics --bootstrap-server kafka:9092 --list && echo 'Topics ready'"]
+    restart: "no"
+
+  # Build the Python app image once; other services reference it
+  app-image:
+    build:
+      context: ..
+      dockerfile: docker/python.Dockerfile
+    image: federated-app:py311
+
+  # One-off data prep job (writes npz shards + preprocess)
+  data_prep:
+    image: federated-app:py311
+    environment: *app_env
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+      - ../scripts:/app/scripts
+    command: bash -lc "python data_prep.py"
+
+  # Flower server
+  flower-server:
+    image: federated-app:py311
+    depends_on:
+      data_prep:
+        condition: service_completed_successfully
+    environment: *app_env
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+    ports:
+      - "8080:8080"
+    command: bash -lc "python server_flower.py"
+
+  flower-client-0:
+    image: federated-app:py311
+    depends_on:
+      flower-server:
+        condition: service_started
+    environment:
+      SERVER_ADDRESS: "flower-server:8080"
+      CSV_PATH: /app/app_data/DATA.csv
+      DATA_DIR: /app/app_data
+      MODELS_DIR: /app/models
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_INFER_REQUESTS: ai.infer.requests
+      TOPIC_RISK_CLASSIFICATIONS: ai.risk.classifications
+      SITE_ID: "0"
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+    command: bash -lc "python client_flower.py --site_id $$SITE_ID"
+
+  flower-client-1:
+    image: federated-app:py311
+    depends_on:
+      flower-server:
+        condition: service_started
+    environment:
+      SERVER_ADDRESS: "flower-server:8080"
+      CSV_PATH: /app/app_data/DATA.csv
+      DATA_DIR: /app/app_data
+      MODELS_DIR: /app/models
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_INFER_REQUESTS: ai.infer.requests
+      TOPIC_RISK_CLASSIFICATIONS: ai.risk.classifications
+      SITE_ID: "1"
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+    command: bash -lc "python client_flower.py --site_id $$SITE_ID"
+
+  flower-client-2:
+    image: federated-app:py311
+    depends_on:
+      flower-server:
+        condition: service_started
+    environment:
+      SERVER_ADDRESS: "flower-server:8080"
+      CSV_PATH: /app/app_data/DATA.csv
+      DATA_DIR: /app/app_data
+      MODELS_DIR: /app/models
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_INFER_REQUESTS: ai.infer.requests
+      TOPIC_RISK_CLASSIFICATIONS: ai.risk.classifications
+      SITE_ID: "2"
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+    command: bash -lc "python client_flower.py --site_id $$SITE_ID"
+
+  flower-client-3:
+    image: federated-app:py311
+    depends_on:
+      flower-server:
+        condition: service_started
+    environment:
+      SERVER_ADDRESS: "flower-server:8080"
+      CSV_PATH: /app/app_data/DATA.csv
+      DATA_DIR: /app/app_data
+      MODELS_DIR: /app/models
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_INFER_REQUESTS: ai.infer.requests
+      TOPIC_RISK_CLASSIFICATIONS: ai.risk.classifications
+      SITE_ID: "3"
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+    command: bash -lc "python client_flower.py --site_id $$SITE_ID"
+
+  # Kafka-backed inference service
+  infer:
+    image: federated-app:py311
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flower-server:
+        condition: service_started
+    environment: *app_env
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../app_data:/app/app_data
+      - ../models:/app/models
+    command: bash -lc "python infer_kafka_service.py"

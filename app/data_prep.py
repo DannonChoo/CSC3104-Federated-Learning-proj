@@ -81,32 +81,18 @@ def load_dataframe() -> pd.DataFrame:
 
 # ---------- Feature selection & preprocessing ----------
 
-def build_preprocess(df: pd.DataFrame):
-    # Exclude leakage/labels from features
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_AS_FEATURES]
-
-    # Drop feature columns that are >60% null OR constant (nunique <= 1)
-    to_drop = []
-    for c in feature_cols:
-        null_pct = df[c].isna().mean()
-        if null_pct > 0.60 or df[c].nunique(dropna=True) <= 1:
-            to_drop.append(c)
-    if to_drop:
-        feature_cols = [c for c in feature_cols if c not in to_drop]
-
-    # Split into features/targets
-    X = df[feature_cols].copy()
-    Y = df[TARGET_COLS].astype(int).values  # shape (N, n_tasks)
+def build_preprocess_for_train(df_train: pd.DataFrame, feature_cols):
+    Xtr = df_train[feature_cols].copy()
 
     # Separate types
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = Xtr.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in feature_cols if c not in num_cols]
 
-    # Optional: winsorize numeric to 1st–99th percentile to reduce extreme outliers
+    # Light winsorization ON TRAIN ONLY (optional)
     if num_cols:
-        q_low = X[num_cols].quantile(0.01)
-        q_hi  = X[num_cols].quantile(0.99)
-        X[num_cols] = X[num_cols].clip(lower=q_low, upper=q_hi, axis=1)
+        q_low = Xtr[num_cols].quantile(0.01)
+        q_hi  = Xtr[num_cols].quantile(0.99)
+        Xtr[num_cols] = Xtr[num_cols].clip(lower=q_low, upper=q_hi, axis=1)
 
     numeric = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -122,17 +108,10 @@ def build_preprocess(df: pd.DataFrame):
         ("cat", categorical, cat_cols)
     ])
 
-    Xt = pre.fit_transform(X)
+    # Fit on TRAIN ONLY
+    pre.fit(Xtr)
 
-    info = {
-        "feature_cols": feature_cols,
-        "num_cols": num_cols,
-        "cat_cols": cat_cols,
-        "dropped_cols_high_null_or_constant": to_drop,
-        "transformed_shape": [int(Xt.shape[0]), int(Xt.shape[1])],
-    }
-    print(f"[data_prep] Features kept: {len(feature_cols)} | dropped: {len(to_drop)} | transformed to {Xt.shape}")
-    return pre, Xt, Y, info
+    return pre, num_cols, cat_cols
 
 # ---------- Federated shards (non-IID, stratified by a primary label) + holdout ----------
 
@@ -148,71 +127,84 @@ def make_non_iid_splits(Xt, Y, n_sites, stratify_idx=0):
 def main():
     DATA_DIR.mkdir(exist_ok=True, parents=True)
 
-    # Load & EDA
+    # 1) Load raw, drop columns, ensure targets are present/typed
     df = load_dataframe()
+
+    # EDA
     eda = eda_summary(df, TARGET_COLS)
-
-    # Save EDA
-    with open(DATA_DIR / "eda_report.json", "w") as f:
-        json.dump(eda, f, indent=2)
+    (DATA_DIR / "eda_report.json").write_text(json.dumps(eda, indent=2))
     print("[data_prep] EDA summary saved to data/eda_report.json")
-    # Brief print
-    chd_col = TARGET_COLS[0]  # assume order aligns with HEADS (chd first)
-    pos_rate = float(df[chd_col].mean())
-    print(f"[data_prep] Rows={len(df)} | CHD Positives={df[chd_col].sum()} | CHD PosRate={pos_rate:.4f}")
 
-    # Build preprocessing & transform
-    pre, Xt_full, Y_full, prep_info = build_preprocess(df)
+    # Feature selection (exclude leakage)
+    feature_cols = [c for c in df.columns if c not in EXCLUDE_AS_FEATURES]
 
-    # Create a proper holdout (20%) before federated sharding for eval
+    # Drop bad features (>60% null or constant)
+    to_drop = []
+    for c in feature_cols:
+        null_pct = df[c].isna().mean()
+        if null_pct > 0.60 or df[c].nunique(dropna=True) <= 1:
+            to_drop.append(c)
+    if to_drop:
+        feature_cols = [c for c in feature_cols if c not in to_drop]
+
+    # Targets as a 2D array
+    Y_full = df[TARGET_COLS].astype(int).values
+
+    # Split indices FIRST (stratify by CHD = Y_full[:,0])
+    import numpy as np
+    from sklearn.model_selection import train_test_split, StratifiedKFold
+
     idx_all = np.arange(len(Y_full))
-    # Stratify by CHD (first target) for split stability
     idx_train, idx_hold = train_test_split(
         idx_all, test_size=0.20, stratify=Y_full[:, 0], random_state=42
     )
-    Xt_train, Y_train = Xt_full[idx_train], Y_full[idx_train]
-    Xt_hold,  Y_hold  = Xt_full[idx_hold],  Y_full[idx_hold]
 
-    # Save preprocessing pipeline and specs
+    df_train = df.iloc[idx_train].reset_index(drop=True)
+    df_hold  = df.iloc[idx_hold].reset_index(drop=True)
+
+    # Fit preprocessor on TRAIN
+    pre, num_cols, cat_cols = build_preprocess_for_train(df_train, feature_cols)
+
+    # Transform train/holdout separately
+    def apply_transform(df_subset):
+        Xs = df_subset[feature_cols].copy()
+        # If you kept winsorization inside build_preprocess_for_train, you can
+        # optionally duplicate the clip here OR skip it entirely (apply only on train).
+        return pre.transform(Xs)
+
+    Xt_train = apply_transform(df_train)
+    Xt_hold  = apply_transform(df_hold)
+    Y_train  = df_train[TARGET_COLS].astype(int).values
+    Y_hold   = df_hold[TARGET_COLS].astype(int).values
+
+    # Persist preprocessor and spec
+    from joblib import dump
     dump(pre, DATA_DIR / "preprocess.joblib")
     spec = {
-        "feature_cols": prep_info["feature_cols"],
-        "num_cols": prep_info["num_cols"],
-        "cat_cols": prep_info["cat_cols"],
+        "feature_cols": feature_cols,
+        "num_cols": num_cols,
+        "cat_cols": cat_cols,
         "target_cols": TARGET_COLS,
         "heads": HEADS,
-        "dropped_cols_high_null_or_constant": prep_info["dropped_cols_high_null_or_constant"],
-        "transformed_dim": prep_info["transformed_shape"][1],
+        "dropped_cols_high_null_or_constant": to_drop,
+        "transformed_dim": int(Xt_train.shape[1]),
     }
-    with open(DATA_DIR / "feature_spec.json", "w") as f:
-        json.dump(spec, f, indent=2)
+    (DATA_DIR / "feature_spec.json").write_text(json.dumps(spec, indent=2))
     print("[data_prep] Saved preprocess.joblib and feature_spec.json")
 
-    # Save holdout set for server-side evaluation
+    # Save a clean holdout (server evaluation is now trustworthy)
     np.savez(DATA_DIR / "holdout.npz", X=Xt_hold, y=Y_hold)
-    print(f"[data_prep] Saved holdout.npz: X={Xt_hold.shape}, y_pos_each={[int(Y_hold[:,i].sum()) for i in range(Y_hold.shape[1])]}, n={len(Y_hold)}")
 
-    # Build federated shards from TRAIN ONLY (stratify by CHD index 0)
-    shards = make_non_iid_splits(Xt_train, Y_train, n_sites=NUM_CLIENTS, stratify_idx=0)
-    for site_id, idx in enumerate(shards):
+    # Build federated shards from TRAIN ONLY
+    skf = StratifiedKFold(n_splits=NUM_CLIENTS, shuffle=True, random_state=42)
+    y_primary = Y_train[:, 0]
+    for site_id, (_, idx) in enumerate(skf.split(Xt_train, y_primary)):
         X_site = Xt_train[idx]
         Y_site = Y_train[idx]
         np.savez(DATA_DIR / f"site_{site_id}.npz", X=X_site, y=Y_site)
-        pos_each = [int(Y_site[:,i].sum()) for i in range(Y_site.shape[1])]
-        print(f"[data_prep] Saved site_{site_id}.npz: X={X_site.shape}, y_pos_each={pos_each}, n={len(Y_site)}")
+        print(f"[data_prep] Saved site_{site_id}.npz: X={X_site.shape}, n={len(Y_site)}")
 
-    # Save a brief prep report
-    prep_report = {
-        "num_clients": NUM_CLIENTS,
-        "train_rows": int(len(Y_train)),
-        "holdout_rows": int(len(Y_hold)),
-        "train_pos_rate_CHD": float(Y_train[:,0].mean()),
-        "holdout_pos_rate_CHD": float(Y_hold[:,0].mean()),
-        "transformed_dim": int(Xt_full.shape[1]),
-    }
-    with open(DATA_DIR / "prep_report.json", "w") as f:
-        json.dump(prep_report, f, indent=2)
-    print("[data_prep] prep_report.json written. Done.")
+    print("[data_prep] Done.")
 
 if __name__ == "__main__":
     main()

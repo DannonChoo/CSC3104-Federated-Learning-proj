@@ -21,7 +21,7 @@ TARGET_COLS = [
 HEADS = ["chd", "cvd", "ckd", "dm", "hmod"]
 
 # Columns to drop if any for later
-DROP_COLS = []
+DROP_COLS = ["Patients' no."]
 
 # Exclude all target labels from inputs
 EXCLUDE_AS_FEATURES = TARGET_COLS[:]

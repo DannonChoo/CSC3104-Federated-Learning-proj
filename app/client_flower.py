@@ -30,12 +30,23 @@ def compute_sample_weights_multi(Ym: np.ndarray):
 class MultiTaskClient(fl.client.NumPyClient):
     def __init__(self, site_id: int):
         data = np.load(DATA_DIR / f"site_{site_id}.npz")
-        self.X = data["X"]
-        self.Ym = data["y"]  # shape (N, 5)
-        self.y = {h: self.Ym[:, i] for i, h in enumerate(HEADS)}
-        self.model = build_model(input_dim=self.X.shape[1], lr=LEARNING_RATE)
+        X = data["X"]
+        Ym = data["y"]  # shape (N, 5)
+        n = X.shape[0]
+        # deterministic split (last 10% as val)
+        n_val = max(1, int(0.1 * n))
+        idx = np.arange(n)
+        # you can shuffle once with a fixed seed if you prefer
+        train_idx, val_idx = idx[:-n_val], idx[-n_val:]
+
+        self.X_tr, self.X_val = X[train_idx], X[val_idx]
+        self.Ym_tr, self.Ym_val = Ym[train_idx], Ym[val_idx]
+        self.y_tr = {h: self.Ym_tr[:, i] for i, h in enumerate(HEADS)}
+        self.y_val = {h: self.Ym_val[:, i] for i, h in enumerate(HEADS)}
+
+        self.model = build_model(input_dim=X.shape[1], lr=LEARNING_RATE)
         self.site_id = site_id
-        self.sample_weight = compute_sample_weights_multi(self.Ym)
+        self.sample_weight = compute_sample_weights_multi(self.Ym_tr)
 
     def get_parameters(self, config):
         return self.model.get_weights()
@@ -44,23 +55,23 @@ class MultiTaskClient(fl.client.NumPyClient):
         self.model.set_weights(parameters)
         es = EarlyStopping(monitor="val_chd_auc", mode="max", patience=2, restore_best_weights=True)
         history = self.model.fit(
-            self.X, self.y,
+            self.X_tr, self.y_tr,
             epochs=LOCAL_EPOCHS,
             batch_size=BATCH_SIZE,
-            validation_split=0.1,
+            validation_data=(self.X_val, self.y_val),
             verbose=0,
-            sample_weight=self.sample_weight,  # per-head sample weights
+            sample_weight=self.sample_weight,
             callbacks=[es],
         )
         val_chd_auc = float(max(history.history.get("val_chd_auc", [0.0])))
-        return self.model.get_weights(), len(self.X), {"val_chd_auc": val_chd_auc}
+        return self.model.get_weights(), len(self.X_tr), {"val_chd_auc": val_chd_auc}
 
     def evaluate(self, parameters, config):
         self.model.set_weights(parameters)
-        results = self.model.evaluate(self.X, self.y, verbose=0, return_dict=True)
+        results = self.model.evaluate(self.X_val, self.y_val, verbose=0, return_dict=True)
         metrics = {k: float(v) for k, v in results.items() if k.endswith("_auc") or k.endswith("_acc")}
         loss = float(results["loss"])
-        return loss, len(self.X), metrics
+        return loss, len(self.X_val), metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

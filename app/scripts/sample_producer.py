@@ -1,5 +1,3 @@
-
-# app/scripts/sample_producer.py
 """
 Produce inference requests to Kafka using real rows from DATA.csv.
 
@@ -24,6 +22,8 @@ from pathlib import Path
 
 import pandas as pd
 from confluent_kafka import Producer
+
+ID_COLUMN = "Patients' no."
 
 def default_bootstrap():
     if os.getenv("KAFKA_BOOTSTRAP"):
@@ -55,6 +55,7 @@ def coerce_value(v):
     return v
 
 def select_features(row, feature_cols):
+    # Only include model features
     out = {}
     for c in feature_cols:
         out[c] = coerce_value(row.get(c, None))
@@ -67,6 +68,16 @@ def pick_rows(df, n):
         return df.sample(n=len(df), random_state=42).to_dict(orient="records")
     # random sample without replacement
     return df.sample(n=n, random_state=random.randint(0, 10_000)).to_dict(orient="records")
+
+def resolve_patient_id(row):
+    # Prefer the real patient ID from the CSV; fallback to UUID
+    raw = row.get(ID_COLUMN, None)
+    if raw is None:
+        return str(uuid.uuid4())
+    try:
+        return str(int(raw)) if isinstance(raw, float) and raw.is_integer() else str(raw)
+    except Exception:
+        return str(raw) if str(raw).strip() != "" else str(uuid.uuid4())
 
 def main():
     parser = argparse.ArgumentParser()
@@ -83,9 +94,10 @@ def main():
     spec = load_feature_spec()
     feat_cols = spec["feature_cols"]
 
-    # Load only needed columns when possible (fallback to full and select)
+    # Ensure we also load the ID column even if it's excluded from features
+    wanted_cols = set(feat_cols) | {ID_COLUMN}
     try:
-        df = pd.read_csv(csv_path, usecols=lambda c: (c in feat_cols))
+        df = pd.read_csv(csv_path, usecols=lambda c: (c in wanted_cols))
     except Exception:
         df = pd.read_csv(csv_path)
 
@@ -94,9 +106,10 @@ def main():
     p = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
     sent = 0
     for r in rows:
+        patient_id = resolve_patient_id(r)
         features = select_features(r, feat_cols)
         payload = {
-            "patient_id": str(uuid.uuid4()),
+            "patient_id": patient_id,
             "site_id": args.site_id,
             "features": features,
         }
@@ -106,12 +119,12 @@ def main():
     p.flush()
     print(f"Produced {sent} message(s) to {TOPIC} @ {KAFKA_BOOTSTRAP}")
     if sent and len(rows) > 0:
-        # Preview a truncated feature dict
-        sample = select_features(rows[0], feat_cols)
+        sample_row = rows[0]
+        sample_features = select_features(sample_row, feat_cols)
         print("Sample payload:", json.dumps({
-            "patient_id": "...",
+            "patient_id": resolve_patient_id(sample_row),
             "site_id": args.site_id,
-            "features": {k: sample[k] for k in list(sample)[:min(8, len(sample))]}
+            "features": {k: sample_features[k] for k in list(sample_features)[:min(8, len(sample_features))]}
         }, ensure_ascii=False))
 
 if __name__ == "__main__":

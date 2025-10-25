@@ -37,9 +37,9 @@ Sends test requests into Kafka using real rows from app_data/DATA.csv (matching 
 
 ## Current Lifecycle
 1. Prepare: run data_prep.py to generate the preprocessor, feature spec, and site shards.
-2. Train (FL): start flower-server, then start flower-client-0..3. The server updates the global model each round via aggregation. (Only one place (commonly client 0 or the server) should save the checkpoint file to avoid file lock races.)
+2. Train (FL): start flower-server, then start flower-client-0..3. The server updates the global model each round via aggregation.
 3. Serve: start infer. It loads the latest model + preprocessor and sits on Kafka.
-4. Use: your dashboard or any app can produce requests to ai.infer.requests and consume classifications from ai.risk.classifications.
+4. Use dashboard or app that can produce requests to ai.infer.requests and consume classifications from ai.risk.classifications.
 
 ## Local setup for testing
 1. Activate environment
@@ -131,3 +131,4 @@ docker exec -it kafka bash -lc \
   "kafka-console-consumer --bootstrap-server kafka:9092 \
    --topic ai.risk.classifications --from-beginning --timeout-ms 30000"
 ~~~
+
